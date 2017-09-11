@@ -9,8 +9,9 @@ use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use futures::{Future, IntoFuture, Stream, Sink};
 use futures::sync::{oneshot, mpsc};
-use hyper::{Chunk, Body};
+use hyper::{Chunk, Body, StatusCode};
 use hyper::server::{Http, Service, Request, Response};
+use hyper::header::{ContentDisposition, DispositionType, DispositionParam, Charset};
 
 struct StaticService {
     provider: mpsc::Sender<Msg>,
@@ -34,10 +35,25 @@ impl Service for StaticService {
         };
         let send_msg = provider.send(send_file)
             .map_err(|_| other("can't send task"));
-        let get_mime = rx.map(move |mime| {
-                Response::new().with_body(body)
+        let get_mime = rx.map(move |value| {
+            if let Some(filename) = value {
+                    let header = ContentDisposition {
+                        disposition: DispositionType::Attachment,
+                        parameters: vec![DispositionParam::Filename(
+                            Charset::Iso_8859_1,
+                            None,
+                            filename.into_bytes(),
+                        )],
+                    };
+                    Response::new()
+                        .with_header(header)
+                        .with_body(body)
+                } else {
+                    Response::new()
+                        .with_status(StatusCode::NotFound)
+                }
             })
-            .map_err(|_| other("can't get mime type"));
+            .map_err(|_| other("can't find file"));
         let fut = send_msg.and_then(|_| get_mime).map_err(hyper::Error::from);
         Box::new(fut)
     }
@@ -47,10 +63,11 @@ enum Msg {
     Register{
         path: String,
         file: File,
+        filename: String,
     },
     SendFile {
         path: String,
-        mime: oneshot::Sender<()>,
+        mime: oneshot::Sender<Option<String>>,
         body: mpsc::Sender<hyper::Result<Chunk>>,
     },
 }
@@ -61,11 +78,13 @@ pub struct Registrator {
 }
 
 impl Registrator {
-    pub fn register(&self, path: &str, file: File) {
+    pub fn register(&self, path: &str, file: File, filename: &str) {
         let path = path.to_owned();
+        let filename = filename.to_owned();
         let msg = Msg::Register {
             path,
             file,
+            filename,
         };
         self.provider.clone().send(msg).wait().unwrap();
     }
@@ -92,15 +111,15 @@ pub fn serve<A: ToSocketAddrs>(addr: A) -> (thread::JoinHandle<hyper::Result<()>
             let map = HashMap::new();
             let registrator = rx.fold(map, move |mut map, msg| {
                 match msg {
-                    Msg::Register{path, file} => {
-                        map.insert(path, file);
+                    Msg::Register { path, file, filename } => {
+                        map.insert(path, (file, filename));
                         mybox(Ok(map).into_future())
                     },
-                    Msg::SendFile{path, mime, body} => {
-                        let file = map.remove(&path);
-                        if let Some(file) = file {
-                            let send_mime = mime.send(())
-                                .into_future();
+                    Msg::SendFile { path, mime, body } => {
+                        if let Some((file, filename)) = map.remove(&path) {
+                            let send_mime = mime.send(Some(filename))
+                                .into_future()
+                                .map_err(|_| ());
                             thread::spawn(move || {
                                 let mut file = file;
                                 let mut buffer = [0; 1024];
@@ -119,8 +138,9 @@ pub fn serve<A: ToSocketAddrs>(addr: A) -> (thread::JoinHandle<hyper::Result<()>
                             });
                             mybox(send_mime.map(|_| map))
                         } else {
-                            let send_mime = mime.send(())
-                                .into_future();
+                            let send_mime = mime.send(None)
+                                .into_future()
+                                .map_err(|_| ());
                             mybox(send_mime.map(|_| map))
                         }
                     },
